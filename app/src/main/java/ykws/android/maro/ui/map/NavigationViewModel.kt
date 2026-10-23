@@ -123,6 +123,12 @@ class NavigationViewModel(
     /** Initial settings snapshot — used to seed StateFlow initial values. */
     private val initialAppSettings: AppSettings = settingsManager.settings.value
 
+    /**
+     * The viewport as last persisted, read fresh: the settings store outlives an Activity, so a
+     * ViewModel built for a reopened app must not seed from the snapshot taken at process start.
+     */
+    private val initialViewport: SettingsManager.Viewport = settingsManager.loadViewport()
+
     /** Reactive settings StateFlow — seeded from the snapshot above, so the first composition already
      *  reads the persisted values, then bridged to [SettingsManager.settings] after init. */
     val settings: StateFlow<AppSettings> = MutableStateFlow(initialAppSettings)
@@ -145,7 +151,7 @@ class NavigationViewModel(
             repository.loadCoastline()
 
             // Only fall back to coastline centroid if no persisted position was ever saved
-            if (initialAppSettings.mapCenterLat.isNaN()) {
+            if (initialViewport.centerLat.isNaN()) {
                 val data = repository.getCoastlineData()
                 if (data != null) {
                     val allPoints = data.allSegments.flatMap { it.points }
@@ -182,8 +188,8 @@ class NavigationViewModel(
 
     /** Center point of the map — seeded from persisted settings or default (Cannes). */
     private val _mapCenter: MutableStateFlow<LatLng> = MutableStateFlow(
-        if (initialAppSettings.mapCenterLat.isNaN().not())
-            LatLng(initialAppSettings.mapCenterLat, initialAppSettings.mapCenterLon)
+        if (initialViewport.centerLat.isNaN().not())
+            LatLng(initialViewport.centerLat, initialViewport.centerLon)
         else
             LatLng(43.55, 7.00)
     )
@@ -197,26 +203,26 @@ class NavigationViewModel(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5_000), _mapCenter.value)
 
     /** True if the current map center is on the water side of the coastline. */
-    private val _isWater: MutableStateFlow<Boolean> = MutableStateFlow(initialAppSettings.isWater)
+    private val _isWater: MutableStateFlow<Boolean> = MutableStateFlow(initialViewport.isWater)
     val isWater: StateFlow<Boolean> = _isWater.asStateFlow()
 
     /** True when the boat's GPS fix position is on water (land/water test against the
      * boat's actual position, not the map centre). Exposed for Tasker integration.
      * Seeded from persisted settings so the notification is correct before first GPS fix. */
-    private val _boatIsWater = MutableStateFlow(initialAppSettings.isWater)
+    private val _boatIsWater = MutableStateFlow(initialViewport.isWater)
     val boatIsWater: StateFlow<Boolean> = _boatIsWater.asStateFlow()
 
     /** Distance (meters) from the current map center to the nearest coastline point.
      * `null` when no coastline is loaded or distance cannot be computed. */
     private val _distanceToShore: MutableStateFlow<Double?> = MutableStateFlow(
-        if (initialAppSettings.distanceToShore.isNaN()) null
-        else initialAppSettings.distanceToShore
+        if (initialViewport.distanceToShoreM.isNaN()) null
+        else initialViewport.distanceToShoreM
     )
     val distanceToShore: StateFlow<Double?> = _distanceToShore.asStateFlow()
 
     /** Current map zoom level (the shipped 11.0–20.0 range) — seeded from persisted settings or default 11.0. */
     private val _zoomLevel: MutableStateFlow<Double> = MutableStateFlow(
-        if (initialAppSettings.zoomLevel > 0.0) initialAppSettings.zoomLevel else 11.0
+        if (initialViewport.zoom > 0.0) initialViewport.zoom else 11.0
     )
     val zoomLevel: StateFlow<Double> = _zoomLevel.asStateFlow()
 
@@ -1367,13 +1373,13 @@ class NavigationViewModel(
         val newCenter = LatLng(latitude, longitude)
         if (_mapCenter.value == newCenter) return
         _mapCenter.value = newCenter
-        // Throttle settings persistence to ~1 Hz — every scroll event (60 fps) would trigger
-        // appSettings StateFlow → Compose recomposition at 60 fps, bypassing uiMapCenter throttle.
-        // Full position is persisted via savePosition() at ON_PAUSE for crash recovery.
+        // Throttle the write to ~1 Hz, and write the viewport alone: the settings object is not
+        // touched, so a pan never re-emits every setting to every collector. The full position is
+        // persisted via savePosition() at ON_PAUSE for crash recovery.
         val nowMs = SystemClock.elapsedRealtime()
         if (nowMs - lastPersistMs >= 1_000L) {
             lastPersistMs = nowMs
-            settingsManager.update { it.copy(mapCenterLat = latitude, mapCenterLon = longitude) }
+            settingsManager.persistViewport(centerLat = latitude, centerLon = longitude)
         }
         // Demo mode: extrapolate pan velocity → simulated speed in knots (and heading if enabled).
         // **The route mode suspends nothing here any more** (R71): the arming reads the standing pair
@@ -1465,7 +1471,7 @@ class NavigationViewModel(
         val nowMs = SystemClock.elapsedRealtime()
         if (nowMs - lastPersistMs >= 1_000L) {
             lastPersistMs = nowMs
-            settingsManager.update { it.copy(zoomLevel = zoom) }
+            settingsManager.persistViewport(zoom = zoom)
         }
     }
 
@@ -1478,18 +1484,13 @@ class NavigationViewModel(
      */
     fun savePosition() {
         val center = _mapCenter.value
-        val zoom = _zoomLevel.value
-        val water = _isWater.value
-        val dist = _distanceToShore.value
-        settingsManager.update {
-            it.copy(
-                mapCenterLat = center.latitude,
-                mapCenterLon = center.longitude,
-                zoomLevel = zoom,
-                isWater = water,
-                distanceToShore = dist ?: Double.NaN
-            )
-        }
+        settingsManager.persistViewport(
+            centerLat = center.latitude,
+            centerLon = center.longitude,
+            zoom = _zoomLevel.value,
+            isWater = _isWater.value,
+            distanceToShoreM = _distanceToShore.value ?: Double.NaN
+        )
     }
 
     /**
