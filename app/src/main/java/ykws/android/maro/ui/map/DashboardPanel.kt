@@ -391,11 +391,15 @@ private fun AutoSizeValue(
     var contentSize by remember { mutableStateOf(IntSize.Zero) }
     val density = LocalDensity.current
     val fontSize = if (contentSize != IntSize.Zero) {
-        val heightDp = with(density) { contentSize.height.toDp().value }
-        val widthDp = with(density) { contentSize.width.toDp().value }
-        val byHeight = heightDp * 0.70f
-        val byWidth = widthDp * 1.5f / text.length.coerceAtLeast(1)
-        minOf(byHeight, byWidth).coerceAtLeast(14f)
+        // The fit is a size in dp; it becomes a text size through the density's own dp→sp, which is
+        // the platform's font scaling (non-linear from Android 14) rather than a flat division, so
+        // the fitted value stays a fit at every accessibility font size. The 14 sp floor stands.
+        val heightDp = with(density) { contentSize.height.toDp() }
+        val widthDp = with(density) { contentSize.width.toDp() }
+        val byHeightSp = with(density) { (heightDp * 0.70f).toSp() }
+        val byWidthSp = with(density) { (widthDp * 1.5f / text.length.coerceAtLeast(1)).toSp() }
+        val fitSp = if (byHeightSp.value <= byWidthSp.value) byHeightSp else byWidthSp
+        maxOf(fitSp.value, 14f)
     } else 32f
 
     Box(
@@ -662,15 +666,15 @@ private fun DistanceFace(
     val label = if (boundary == currentZone) {
         // Exiting: show what's beyond
         when (currentZone!!.beyondType) {
-            BeyondType.OPEN_SEA -> "open water"
+            BeyondType.OPEN_SEA -> stringResource(R.string.dash_beyond_open_water)
             BeyondType.ZONE -> currentZone.beyondName ?: currentZone.zoneName
-            BeyondType.LAND -> "land" // unreachable due to exclusion above
+            BeyondType.LAND -> stringResource(R.string.dash_beyond_land) // unreachable due to exclusion above
         }
     } else {
-        // Entering zone ahead — but if it's the 300m band and we're already
+        // Entering zone ahead — but if it's the 300 m zone and we're already
         // inside it (heading deeper), label "→ shore" instead of "BANDE 300M".
         if (boundary.zoneName == "BANDE 300M" && distanceToShore != null && distanceToShore <= 300.0)
-            "\u2192 shore"
+            stringResource(R.string.dash_toward_shore)
         else
             boundary.zoneName
     }
@@ -830,7 +834,7 @@ private fun SpeedLimitCard(
 
         val subtitle = if (isNearExit) {
             when (current.beyondType) {
-                BeyondType.OPEN_SEA -> "open water"
+                BeyondType.OPEN_SEA -> stringResource(R.string.dash_beyond_open_water)
                 BeyondType.ZONE -> "\u2192 ${current.beyondName ?: current.zoneName}"
                 BeyondType.LAND -> ""  // land exit → no subtitle
             }
@@ -1029,9 +1033,13 @@ private fun SpeedCard(
     } else {
         DashboardColors.cardBg
     }
-    val subtitle = if (activeSpeedLimitKn != null)
-        stringResource(R.string.dash_speed_zone_limit, activeSpeedLimitKn)
-    else null
+    // The breach is said in words beside the colour, so it never rides on the colour alone.
+    val subtitle = if (activeSpeedLimitKn != null) {
+        val limitText = stringResource(R.string.dash_speed_zone_limit, activeSpeedLimitKn)
+        if (speedKnots > activeSpeedLimitKn.toFloat())
+            stringResource(R.string.dash_speed_over_limit_fmt, limitText)
+        else limitText
+    } else null
     // On land the reading switches to whole km/h — the road unit a shore position calls for; at sea
     // the knot forms stand, integer at ≥ 10 kn (shorter = bigger font) and a decimal below.
     val speedText = when {
