@@ -27,7 +27,9 @@ import ykws.android.maro.spatial.Units
  * pull's own field for a candidate that drops it — the grid's own limits were dropped by the caller —
  * so the dropped price is dropped from the search and the guard alike. One cursor prices both sources,
  * so a candidate never names a second λ. [publish] and [trace] are the engine's own, handed in so the
- * emission sequence never belongs to the seat.
+ * emission sequence never belongs to the seat, and so is [checkCancelled]: the search reads the calling
+ * job itself, but the two pulls are plain loops, so the engine hands them its job's `ensureActive` as a
+ * plain lambda and a cancelled lookup stops inside the pull rather than after it.
  *
  * **The provisional pair rides two boundaries on every pass.** At the [RouteStage.PULL] boundary it
  * carries the A* cell path's own length and limit-read clock, and between the first pull and the corner
@@ -45,7 +47,8 @@ internal class RoutePassRunner {
             { _, _, _, _ -> },
         trace: (() -> String) -> Unit = {},
         guardZones: Boolean = true,
-        guardBand: Boolean = true
+        guardBand: Boolean = true,
+        checkCancelled: () -> Unit = {}
     ): PassReading {
         val world = ctx.world
         val grid = walk.grid
@@ -60,7 +63,8 @@ internal class RoutePassRunner {
         val limitAt = ctx.limitAt
         val zones = ctx.zones
         val sets = ctx.sets
-        val refusals = ctx.refusals
+        // The pass's own tally: a rung's refusals are its own and never a sibling's (see [PassReading.refusals]).
+        val refusals = PullRefusals()
         // The guard reads the water the snap guards: for a two-layer walk that is the fine band's own cell,
         // not the interior's, so the tail's prices sit at the resolution the line was resolved at (Phase 6).
         val tailCellM = if ((walk.windows?.layerCount ?: 1) > 1) ctx.fineCellM else cellM
@@ -116,7 +120,7 @@ internal class RoutePassRunner {
             gate = gate
         )
         val path = search.path
-            ?: return PassReading(search, emptyList(), null, SlowShares(0.0, 0.0, 0.0), 0, 0)
+            ?: return PassReading(search, emptyList(), refusals, 0, 0)
         // The path carries its layer, so a two-layer walk resolves each cell on its own resolution rather
         // than through the first layer that happens to hold its coordinate.
         val coarse = path.map { windows.center(it.layer, it.row, it.col) }
@@ -126,27 +130,32 @@ internal class RoutePassRunner {
         // The cell path already supports a first provisional pair — its length and its limit-read clock.
         // It is an overestimate by nature (the path is jagged until the pull), so the pair jumps at the
         // pull's own SNAP boundary and again at the landing; the row's stage word says it is not final.
-        val cellPathTimed = timeLineWithLimits(full, pace, limitAt, clockSampleM(cellM, ctx.fineCellM))
-        if (publishStage) publish(
-            RouteStage.PULL, full.map { RoutePoint.of(it) },
-            listOf(
-                RouteStepReading(
-                    RouteStage.SEARCH, R.string.route_reading_expansions,
-                    search.expansions.toDouble(), R.string.route_unit_cells
+        // The clock is paid only where the boundary is published: it is a reading, never an input.
+        if (publishStage) {
+            val cellPathTimed = timeLineWithLimits(full, pace, limitAt, clockSampleM(cellM, ctx.fineCellM))
+            publish(
+                RouteStage.PULL, full.map { RoutePoint.of(it) },
+                listOf(
+                    RouteStepReading(
+                        RouteStage.SEARCH, R.string.route_reading_expansions,
+                        search.expansions.toDouble(), R.string.route_unit_cells
+                    ),
+                    RouteStepReading(
+                        RouteStage.SEARCH, R.string.route_reading_passable_cells,
+                        search.passableCells.toDouble(), R.string.route_unit_cells
+                    )
                 ),
-                RouteStepReading(
-                    RouteStage.SEARCH, R.string.route_reading_passable_cells,
-                    search.passableCells.toDouble(), R.string.route_unit_cells
-                )
-            ),
-            RouteProvisional(pulledLengthM(full), cellPathTimed.durationSec)
-        )
+                RouteProvisional(pulledLengthM(full), cellPathTimed.durationSec)
+            )
+        }
         val pullTiming = PullTiming()
         val pullStartNs = System.nanoTime()
         // Both pulls read the path from both ends and keep the cheaper, so a pair armed from either end draws
         // one line from one cell chain (`261020_FEAT_PLN_Route_direction-symmetry.md`).
         val pullSplit = PullSplit()
-        val pulled = MultipassPull.pullBothWays(setup, full, refusals, pullTiming, split = pullSplit)
+        val pulled = MultipassPull.pullBothWays(
+            setup, full, refusals, pullTiming, split = pullSplit, checkCancelled = checkCancelled
+        )
         trace { splitText("PULL2", pullSplit) }
         trace {
             "PULL zoneM=${fmt(zoneMetres(zones, pulled))} ms=${fmt(msSince(pullStartNs))} " +
@@ -159,26 +168,32 @@ internal class RoutePassRunner {
         // The provisional pair belongs to this boundary and to the pulled line alone: the line is taut
         // here, but the settled clock is still the pull → snap → pull tail and the corner pass away, so
         // one enforced-limit read and the pulled length are all a row can stand behind now. It rides the
-        // SNAP boundary for **every** pass, because each rung's own row waits on its own line.
-        val provisionalTimed = timeLineWithLimits(pulled, pace, limitAt, clockSampleM(cellM, ctx.fineCellM))
-        val provisional = RouteProvisional(pulledLengthM(pulled), provisionalTimed.durationSec)
-        publish(
-            RouteStage.SNAP, pulled.map { RoutePoint.of(it) },
-            listOf(
-                RouteStepReading(
-                    RouteStage.PULL, R.string.route_reading_pulled_points,
-                    pulled.size.toDouble(), R.string.route_unit_points
-                )
-            ),
-            provisional
-        )
+        // SNAP boundary for **every** published pass, because each rung's own row waits on its own line.
+        if (publishStage) {
+            val provisionalTimed = timeLineWithLimits(pulled, pace, limitAt, clockSampleM(cellM, ctx.fineCellM))
+            publish(
+                RouteStage.SNAP, pulled.map { RoutePoint.of(it) },
+                listOf(
+                    RouteStepReading(
+                        RouteStage.PULL, R.string.route_reading_pulled_points,
+                        pulled.size.toDouble(), R.string.route_unit_points
+                    )
+                ),
+                RouteProvisional(pulledLengthM(pulled), provisionalTimed.durationSec)
+            )
+        }
         val snapStartNs = System.nanoTime()
-        val snapped = snapToCorners(setup, sets, pulled)
+        // The snap is a forward greedy — a bend's clearance reads its already-snapped predecessor and its
+        // not-yet-snapped successor — so it is run in the pair's canonical direction and turned back, and a
+        // pair armed from either end snaps one line (`261020_FEAT_PLN_Route_direction-symmetry.md`).
+        val snapped = inCanonicalDirection(pulled, setup) { line, water -> snapToCorners(water, sets, line) }
         trace { "SNAP zoneM=${fmt(zoneMetres(zones, snapped))} ms=${fmt(msSince(snapStartNs))}" }
         val finalTiming = PullTiming()
         val finalStartNs = System.nanoTime()
         val finalSplit = PullSplit()
-        val final = MultipassPull.pullBothWays(setup, snapped, refusals, finalTiming, split = finalSplit)
+        val final = MultipassPull.pullBothWays(
+            setup, snapped, refusals, finalTiming, split = finalSplit, checkCancelled = checkCancelled
+        )
         trace { splitText("FINAL2", finalSplit) }
         trace {
             "FINAL zoneM=${fmt(zoneMetres(zones, final))} ms=${fmt(msSince(finalStartNs))} " +
@@ -188,16 +203,12 @@ internal class RoutePassRunner {
                 "memoEdgeHits=${finalTiming.memoEdgeHits} farEdgeReads=${finalTiming.farEdgeReads} " +
                 "stepM=${fmt(finalTiming.stepM)} priceStepM=${fmt(finalTiming.priceStepM)}"
         }
-        val timed = timeLineWithLimits(
-            final, pace, limitAt, clockSampleM(cellM, ctx.fineCellM)
-        )
-        val shares = slowShares(timed, pace, inZone = inZone(zones), inBand = inBand(world))
-        return PassReading(search, final, timed, shares, pulled.size, snapped.size)
+        return PassReading(search, final, refusals, pulled.size, snapped.size)
     }
 
     /**
      * **The search, run from the pair's canonical end so a pair is one search from either end.** The A\* breaks
-     * a cost tie by arrival order from wherever it starts, so an island on the line, with two equal detours,
+     * a cost tie by `f`, then `g`, then slot index from wherever it starts, so an island on the line, with two equal detours,
      * could be taken on opposite sides by A→B and B→A, and the pull was then handed two chains it could not
      * reconcile. Here the walk always leaves the end that [sortsFirst] — the aim's end, when the start sorts
      * after it, with the two cells **and** the guard's two raw points swapped together — and the cell path is
@@ -220,7 +231,7 @@ internal class RoutePassRunner {
         start: LatLng,
         aim: LatLng,
         paceMps: Double,
-        zonePriceSec: (cellM: Double, interiorLimitKn: Double, collarLimitKn: Double, bandCollarLimitKn: Double) -> Double,
+        zonePriceSec: ZonePrice,
         berthK: Double,
         berth: BerthLaw?,
         gate: GateRule?

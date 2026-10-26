@@ -17,6 +17,13 @@ import kotlin.math.min
 internal data class FineTileSide(val latDeg: Double, val lonDeg: Double)
 
 /**
+ * **An end of the pair stands outside the region the world covers** — thrown by [RouteGridBuilder.buildGrid]
+ * instead of clamping the end onto the grid's edge, so the engine answers the pair by name
+ * ([ykws.android.maro.spatial.RouteReason.OFF_WATER]) rather than searching to the wrong point.
+ */
+internal class RouteOffWaterException : RuntimeException("an end of the pair stands outside the covered region")
+
+/**
  * **One grid build** — the corridor → the harvest → the grid, **once** → the ends' discs → the
  * corner sets, lifted out of the pass pipeline so the context build and its instrument readers are a
  * named seat of their own.
@@ -44,7 +51,13 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
      * share it and each rung prices its own pass. `null` where the corridor is empty.
      *
      * The pace is the engine's own and is asked at its call, like its instrument: [trace] is handed in
-     * rather than owned here, so the seat never owns the emission sequence.
+     * rather than owned here, so the seat never owns the emission sequence — and so is [checkCancelled],
+     * the calling job's own cancel read, handed to the raster's plain loops.
+     *
+     * **An end outside the region is refused, never clamped.** The corridor is cut to the region's bounds,
+     * and the end cells used to be clamped onto the grid's edge with it, so a pair with an end off the baked
+     * water was searched to the wrong point in silence. It now throws [RouteOffWaterException], which the
+     * engine answers as [ykws.android.maro.spatial.RouteReason.OFF_WATER].
      */
     internal suspend fun buildGrid(
         world: MultipassWorld,
@@ -53,9 +66,15 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
         reach: Double,
         pace: Double,
         markerStrength: Double,
-        trace: (() -> String) -> Unit = {}
+        trace: (() -> String) -> Unit = {},
+        checkCancelled: () -> Unit = {}
     ): GridContext? {
-        val corridor = corridorBox(from, to, world.regionBounds, reach)
+        val region = world.regionBounds
+        if (region != null && (!region.holds(from) || !region.holds(to))) {
+            trace { "CORRIDOR reach=${fmt(reach)}m box=n/a offWater=true region=${boxText(region)}" }
+            throw RouteOffWaterException()
+        }
+        val corridor = corridorBox(from, to, region, reach)
         if (corridor == null) {
             trace { "CORRIDOR reach=${fmt(reach)}m box=empty clampedByRegion=n/a" }
             return null
@@ -77,7 +96,7 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
         if (tiles.size > 1) {
             return buildLayeredGrid(
                 world, from, to, box, regionSaturated, edges, openCoast, capLatNorth, tiles, pace,
-                markerStrength, trace
+                markerStrength, trace, checkCancelled
             )
         }
         val cellM = tiles.first().cellM
@@ -118,7 +137,7 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
         val grid = rasterize(
             box, cellM, pace, marginM, edges, openCoast, capLatNorth, gridField, priced,
             zoneOutsideMarginM = zoneOutsideMarginM, band = bandSpec,
-            gate = gate
+            gate = gate, checkCancelled = checkCancelled
         )
         val startCell = grid.cellOf(from.latitude, from.longitude)
         val aimCell = grid.cellOf(to.latitude, to.longitude)
@@ -126,9 +145,10 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
         val aimStateBefore = grid.state(aimCell.row, aimCell.col)
         grid.forceFree(from.latitude, from.longitude)
         grid.forceFree(to.latitude, to.longitude)
+        measureEndCell(grid, startCell, gate)
+        measureEndCell(grid, aimCell, gate)
         openEndDisc(grid, world, from.toLatLng(), marginM, depthGateActive, minDepthM, gate = gate)
         openEndDisc(grid, world, to.toLatLng(), marginM, depthGateActive, minDepthM, gate = gate)
-        val refusals = PullRefusals()
         trace {
             "GRID ${inventory(grid)} " +
                 "start=${cellRead(world, grid, startCell, from, startStateBefore)} " +
@@ -151,7 +171,11 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
                 )
             )
         }
-        val limitAt = limitAtFor(world)
+        // The clock's limit read over the corridor's own zones — the world's whole region would answer the
+        // same for every point inside the box, at the cost of walking every ring of it per sample. They are
+        // the world's zones in the box, **whatever the price switch says**: a switch prices water, it never
+        // suspends a limit, so the clock's set is read off the world and never off the grid's gated `zones`.
+        val limitAt = limitAtFor(world, ZoneSet(world.speedZonesIn(box)))
         // Named construction, never a positional 27th: the `windows` seam defaults to `null` here, which is
         // exactly this single-grid walk — `avoid`'s answer, cell for cell.
         return GridContext(
@@ -160,7 +184,7 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
             zoneOutsideMarginM = zoneOutsideMarginM, pace = pace, markerStrength = markerStrength, grid = grid,
             startCell = startCell, aimCell = aimCell, start = start, aim = aim, sets = sets,
             limitAt = limitAt, zones = zones, priced = priced,
-            refusals = refusals, depthGateActive = depthGateActive, minDepthM = minDepthM,
+            depthGateActive = depthGateActive, minDepthM = minDepthM,
             regionSaturated = regionSaturated, plan = plan, gate = gate
         )
     }
@@ -195,7 +219,8 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
         tiles: List<GridTile>,
         pace: Double,
         markerStrength: Double,
-        trace: (() -> String) -> Unit
+        trace: (() -> String) -> Unit,
+        checkCancelled: () -> Unit = {}
     ): GridContext? {
         val coarseTile = tiles.maxByOrNull { it.cellM }!!
         val fineTile = tiles.minByOrNull { it.cellM }!!
@@ -231,7 +256,6 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
         val depthGateActive = AppConfig.routeAvoidDepthGateEnabled && world.depthReady
         val minDepthM = AppConfig.routeAvoidDepthGateMinM
         val gate = gateRuleOf(world, plan, depthGateActive, minDepthM)
-        val berth = berthLawOf(plan, depthGateActive)
         val fineWater = plan.fineWater(
             FineWaterQuery(
                 world = world, box = box, edges = edges, openCoast = openCoast,
@@ -262,7 +286,7 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
         val interiorGrid = rasterizeWindow(
             coarseBox, family.coarse, pace, marginM, edges, openCoast, capLatNorth, gridField, priced,
             zoneOutsideMarginM = zoneOutsideMarginM, band = bandSpec,
-            gate = gate, collarReachM = fineWater.depthCollarM
+            gate = gate, collarReachM = fineWater.depthCollarM, checkCancelled = checkCancelled
         )
         val fineStartNs = System.nanoTime()
         val windows = ArrayList<WalkWindow>(fineBoxes.size + 1)
@@ -313,13 +337,13 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
                     if (!window.grid.passable(cell.row, cell.col)) continue
                 }
                 window.grid.forceFree(end.latitude, end.longitude)
+                measureEndCell(window.grid, window.grid.cellOf(end.latitude, end.longitude), gate)
                 openEndDisc(
                     window.grid, world, end, marginM, depthGateActive, minDepthM, reachCellM = lattice.cellM,
                     gate = gate
                 )
             }
         }
-        val refusals = PullRefusals()
         // (e) Every count names its layer: a coarse cell is twenty-five fine ones, so the two inventories
         // are printed apart and never summed into one figure the engine cannot stand behind.
         trace {
@@ -343,14 +367,14 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
                 )
             )
         }
-        val limitAt = limitAtFor(world)
+        val limitAt = limitAtFor(world, ZoneSet(world.speedZonesIn(box)))
         return GridContext(
             world = world, from = from, to = to, box = box, edges = edges, openCoast = openCoast,
             capLatNorth = capLatNorth, cellM = cellM, fineCellM = fineCellM, marginM = marginM,
             zoneOutsideMarginM = zoneOutsideMarginM, pace = pace, markerStrength = markerStrength, grid = interiorGrid,
             startCell = startCell, aimCell = aimCell, start = from.toLatLng(), aim = to.toLatLng(),
             sets = sets, limitAt = limitAt, zones = zones, priced = priced,
-            refusals = refusals, depthGateActive = depthGateActive, minDepthM = minDepthM,
+            depthGateActive = depthGateActive, minDepthM = minDepthM,
             regionSaturated = regionSaturated, plan = plan,
             windows = walk, gate = gate
         )
@@ -391,7 +415,7 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
             fine.cellM, baseCostSec(fine.cellM, pace)
         )
         // The arm's own grid opens entirely land; every tile member restores the water the rasterizer wrote.
-        for (row in 0 until rows) for (col in 0 until cols) grid.markLand(row, col)
+        grid.markAllLand()
         val windowRow = fine.rowOf(fineBox.latSouth)
         val windowCol = fine.colOf(fineBox.lonWest)
         val firstTileRow = Math.floorDiv(windowRow, FINE_TILE_CELLS)
@@ -455,7 +479,6 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
         val depthGateActive = AppConfig.routeAvoidDepthGateEnabled && world.depthReady
         val minDepthM = AppConfig.routeAvoidDepthGateMinM
         val gate = gateRuleOf(world, plan, depthGateActive, minDepthM)
-        val berth = berthLawOf(plan, depthGateActive)
         val fineWater = plan.fineWater(
             FineWaterQuery(
                 world = world, box = box, edges = edges, openCoast = openCoast,
@@ -656,8 +679,27 @@ internal class RouteGridBuilder(private val plan: RouteGridPlan = UniformGridPla
     )
 }
 
+    /**
+     * **The end's own cell carries a measured gate distance.** The margin sweep paints a coast-side cell land
+     * before the edge is seeded, and the seeding skips land, so an end `forceFree`d out of the margin kept the
+     * `MAX_VALUE` an unseeded cell opens with — which the search's step guard reads as *proved clear* and so
+     * never measured the step out of it. The cell is measured here exactly as a disc cell is: its centre's
+     * distance to the traced edge within the seed reach, `MAX_VALUE` beyond it, which the guard may then
+     * trust. A cell the seeding already wrote keeps its exact value.
+     */
+    private fun measureEndCell(grid: MultipassGrid, cell: CellIndex, gate: GateRule?) {
+        if (gate == null) return
+        if (grid.gateDistanceM(cell.row, cell.col) < Double.MAX_VALUE) return
+        val centre = grid.center(cell.row, cell.col)
+        grid.writeGateDistanceM(cell.row, cell.col, gate.edgeM(centre, gate.seedReachM(grid.cellM)))
+    }
+
     /** A corridor box and whether the region's own bounds cut it short — the instrument's own reading. */
     private data class Corridor(val box: BBox, val clampedByRegion: Boolean)
+
+    /** Whether [p] stands inside this box, its edges included — the region test the ends are held to. */
+    private fun BBox.holds(p: RoutePoint): Boolean =
+        p.latitude in latSouth..latNorth && p.longitude in lonWest..lonEast
 
     /** The start-aim bounding box inflated by [reach], clamped to the region's bounds — a truncated box is accepted. */
     private fun corridorBox(from: RoutePoint, to: RoutePoint, bounds: BBox?, reach: Double): Corridor? {

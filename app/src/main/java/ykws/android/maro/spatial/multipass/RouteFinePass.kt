@@ -17,20 +17,22 @@ import ykws.android.maro.spatial.Units
 internal class RouteFinePass {
 
     /**
-     * The λ-priced soft cost of [points] against the [setup]'s field — the same per-segment walk the
-     * pull's `softPricePrefix` uses, summed to the whole line, so this comparison prices exactly what
-     * the search and the pull priced. The setup arrives from the call that resolved the line, so this
-     * site inherits the walk's own price step rather than inventing a partition of its own.
+     * **The seconds a line costs against the [setup]'s water** — its travel at the pace plus the λ-priced
+     * soft price, per segment, exactly the `totalSec` every other "no dearer" proof of the pull reads
+     * ([MultipassPull.totalSec]), summed to the whole line. The splice comparison reads this and no other
+     * clock: a crossing re-solve that is cheaper in price but longer in travel is no better line, and the
+     * soft-only sum it read before could accept one. The setup arrives from the call that resolved the
+     * line, so this site inherits the walk's own steps rather than inventing a partition of its own.
      *
-     * It reads the setup's margin, price step and field alone, and folds the water into a tally-free
+     * It reads the setup's margin, steps, pace and field alone, and folds the water into a tally-free
      * context here — a line cost counts and caches nothing.
      */
-    internal fun pricedLineCost(setup: PullSetup, points: List<LatLng>): Double {
+    internal fun lineCostSec(setup: PullSetup, points: List<LatLng>): Double {
         val ctx = setup.context()
-        if (!ctx.hasSoftPrice || points.size < 2) return 0.0
+        if (points.size < 2) return 0.0
         var total = 0.0
         for (i in 1 until points.size) {
-            total += MultipassPull.softPriceSec(points[i - 1], points[i], ctx)
+            total += MultipassPull.totalSec(points[i - 1], points[i], ctx)
         }
         return total
     }
@@ -44,12 +46,43 @@ internal class RouteFinePass {
         ctx: GridContext,
         line: List<LatLng>,
         lambda: Double,
+        /** The calling job's own cancel read, handed to the plain loops — the rasters, the pulls, the sweep. */
+        checkCancelled: () -> Unit = {},
+        /** Whether anything reads [trace] — gates the sweep's arm report, which is work only a reader wants. */
+        traceLive: Boolean = true,
+        // Last on purpose: a caller may pass the trace as a trailing lambda.
         trace: (() -> String) -> Unit = {}
+    ): List<LatLng> {
+        if (line.size < 2) return line
+        // **The refinement runs in the pair's canonical direction.** Its re-solves, its two pulls, the sweep,
+        // the straightener and the nudge each read the line from one end, so handed one line reversed they
+        // could settle a different point; turned so the first point sorts before the last — the ends swapped
+        // with it, their discs being symmetric — and turned back at the exit, a pair armed from either end is
+        // refined as one line (`261020_FEAT_PLN_Route_direction-symmetry.md`).
+        val reversed = !sortsFirst(line.first(), line.last())
+        val oriented = if (reversed) line.asReversed() else line
+        val refined = refineOriented(
+            ctx, oriented, lambda,
+            start = if (reversed) ctx.aim else ctx.start,
+            aim = if (reversed) ctx.start else ctx.aim,
+            checkCancelled = checkCancelled, traceLive = traceLive, trace = trace
+        )
+        return if (reversed) refined.reversed() else refined
+    }
+
+    /** [finePass]'s body over a line whose first point sorts before its last, [start] and [aim] its own ends. */
+    private suspend fun refineOriented(
+        ctx: GridContext,
+        line: List<LatLng>,
+        lambda: Double,
+        start: LatLng,
+        aim: LatLng,
+        checkCancelled: () -> Unit,
+        traceLive: Boolean,
+        trace: (() -> String) -> Unit
     ): List<LatLng> {
         val world = ctx.world
         val corridor = ctx.box
-        val start = ctx.start
-        val aim = ctx.aim
         val pace = ctx.pace
         val cellM = ctx.cellM
         val marginM = ctx.marginM
@@ -60,7 +93,9 @@ internal class RouteFinePass {
         val priced = ctx.priced
         val zones = ctx.zones
         val sets = ctx.sets
-        val refusals = ctx.refusals
+        // The refinement's own tally — never the pass's, and never a sibling rung's: the sweep's gate below
+        // reads what this line's own settled pull refused, as its KDoc says.
+        val refusals = PullRefusals()
         val fineCellM = ctx.fineCellM
         if (line.size < 2 || fineCellM <= 0.0 || fineCellM >= cellM) return line
         // The **clearance** step is this fine grid's own cell — the line is sampled at the resolution it
@@ -76,7 +111,7 @@ internal class RouteFinePass {
             out = solveCrossing(
                 world, corridor, out, zone, start, aim, pace, cellM, fineCellM, marginM, outsideMarginM,
                 lambda, edges, openCoast, capLatNorth, priced, zones, sets, refusals,
-                ctx.markerStrength, ctx.plan, ctx.gate, trace
+                ctx.markerStrength, ctx.plan, ctx.gate, checkCancelled, trace
             ) ?: out
         }
         val fineGuard =
@@ -94,7 +129,7 @@ internal class RouteFinePass {
         // Both pulls report the tallies the runner's own PULL and FINAL lines carry, so one pass taken
         // the way the device takes it says whether the price walk grouped at all on this fine grid.
         val pullTiming = PullTiming()
-        val pulled = MultipassPull.pull(setup, out, refusals, pullTiming)
+        val pulled = MultipassPull.pull(setup, out, refusals, pullTiming, checkCancelled = checkCancelled)
         trace {
             "FINE PULL points=${pulled.size} priceReads=${pullTiming.priceReads} marks=${pullTiming.marks} " +
                 "memoPriceHits=${pullTiming.memoPriceHits} " +
@@ -105,11 +140,14 @@ internal class RouteFinePass {
         // The settled walk's own memo, held here so the sweep below shares it and answers a retraced mark
         // rather than paying it again — the walk's context and memo, reused unchanged.
         val settledMemo = MarkMemo()
-        val settled = MultipassPull.pull(setup, snapped, refusals, finalTiming, settledMemo)
+        val settled = MultipassPull.pull(setup, snapped, refusals, finalTiming, settledMemo, checkCancelled)
         // The settled line then carries its own lookback: the removable-vertex sweep drops every bend the
         // pull's own two proofs clear, gated on the line's own refusals, so the corner pass consumes the
         // genuinely taut line rather than the forward-only greedy's first-refusal keep.
-        val swept = MultipassPull.sweep(setup, settled, refusals, finalTiming, settledMemo, trace)
+        val swept = MultipassPull.sweep(
+            setup, settled, refusals, finalTiming, settledMemo, trace, checkCancelled = checkCancelled,
+            traceLive = traceLive
+        )
         trace {
             "FINE settled points=${swept.size} fineCell=${fmt(fineCellM)}m " +
                 "priceReads=${finalTiming.priceReads} marks=${finalTiming.marks} " +
@@ -164,6 +202,7 @@ internal class RouteFinePass {
         plan: RouteGridPlan = UniformGridPlan,
         /** The arm's depth-gate rule — the same measured edge the coarse answer kept off. */
         gate: GateRule? = null,
+        checkCancelled: () -> Unit = {},
         trace: (() -> String) -> Unit = {}
     ): List<LatLng>? {
         val zoneStartNs = System.nanoTime()
@@ -207,7 +246,7 @@ internal class RouteFinePass {
         val grid = rasterize(
             box, fineCellM, pace, marginM, edges, openCoast, capLatNorth, base, priced,
             zoneOutsideMarginM = outsideMarginM, band = bandLaw(world),
-            gate = gate
+            gate = gate, checkCancelled = checkCancelled
         )
         grid.forceFree(from.latitude, from.longitude)
         grid.forceFree(to.latitude, to.longitude)
@@ -251,7 +290,7 @@ internal class RouteFinePass {
         // The crossing's own local pull reports the same tallies the runner's PULL line carries, so a
         // route entering two zones separates their re-solves by their own price reads.
         val pullTiming = PullTiming()
-        val pulled = MultipassPull.pull(setup, localPath, refusals, pullTiming)
+        val pulled = MultipassPull.pull(setup, localPath, refusals, pullTiming, checkCancelled = checkCancelled)
         trace {
             "FINE LOCAL PULL zone=${zone.name} box=${boxText(box)} points=${pulled.size} " +
                 "priceReads=${pullTiming.priceReads} marks=${pullTiming.marks} " +
@@ -259,9 +298,11 @@ internal class RouteFinePass {
                 "stepM=${fmt(pullTiming.stepM)} priceStepM=${fmt(pullTiming.priceStepM)}"
         }
         val snapped = snapToCorners(setup, sets, pulled)
-        val local = MultipassPull.pull(setup, snapped, refusals)
-        val localCost = pricedLineCost(setup, local)
-        val coarseCost = pricedLineCost(setup, line.subList(first, last + 1))
+        val local = MultipassPull.pull(setup, snapped, refusals, checkCancelled = checkCancelled)
+        // Both sides span the same water — the splice's own two ends, `from` and `to` — so the re-solve is
+        // never charged the two flanking legs the coarse stretch kept for free.
+        val localCost = lineCostSec(setup, local)
+        val coarseCost = lineCostSec(setup, line.subList(maxOf(first - 1, 0), minOf(last + 2, line.size)))
         if (localCost > coarseCost) {
             trace {
                 "FINE zone=${zone.name} box=${boxText(box)} spliced=no reason=worse " +

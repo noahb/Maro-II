@@ -1,6 +1,7 @@
 package ykws.android.maro.spatial
 
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
@@ -100,7 +101,7 @@ class RouteAvoidEngineTest {
         val computation = available.computations[rungIndex]
         val subscribed = CompletableDeferred<Unit>()
         val done = CompletableDeferred<RouteUpdate?>()
-        val collector = launch(Dispatchers.Default) {
+        val collector = launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
             engine.updates
                 .onStart { subscribed.complete(Unit) }
                 .collect { update ->
@@ -691,7 +692,7 @@ class RouteAvoidEngineTest {
         val reported = ArrayList<Pair<RouteStage?, List<RouteStepReading>>>()
         val subscribed = CompletableDeferred<Unit>()
         val done = CompletableDeferred<Unit>()
-        val collector = launch(Dispatchers.Default) {
+        val collector = launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
             engine.updates
                 .onStart { subscribed.complete(Unit) }
                 .collect { update ->
@@ -746,7 +747,7 @@ class RouteAvoidEngineTest {
         val stages = ArrayList<RouteStage?>()
         val subscribed = CompletableDeferred<Unit>()
         val done = CompletableDeferred<Unit>()
-        val collector = launch(Dispatchers.Default) {
+        val collector = launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
             engine.updates
                 .onStart { subscribed.complete(Unit) }
                 .collect { update ->
@@ -784,7 +785,7 @@ class RouteAvoidEngineTest {
         val updates = ArrayList<RouteUpdate>()
         val subscribed = CompletableDeferred<Unit>()
         val done = CompletableDeferred<Unit>()
-        val collector = launch(Dispatchers.Default) {
+        val collector = launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
             engine.updates
                 .onStart { subscribed.complete(Unit) }
                 .collect { update ->
@@ -927,7 +928,7 @@ class RouteAvoidEngineTest {
         val subscribed = CompletableDeferred<Unit>()
         val armDone = CompletableDeferred<Unit>()
         val terminals = ConcurrentHashMap<RouteId, RouteUpdate>()
-        val collector = launch(Dispatchers.Default) {
+        val collector = launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
             engine.updates
                 .onStart { subscribed.complete(Unit) }
                 .collect { update ->
@@ -968,7 +969,7 @@ class RouteAvoidEngineTest {
         val secondSubscribed = CompletableDeferred<Unit>()
         val secondMainDone = CompletableDeferred<RouteUpdate>()
         var secondMainId: RouteId? = null
-        val secondCollector = launch(Dispatchers.Default) {
+        val secondCollector = launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
             engine.updates
                 .onStart { secondSubscribed.complete(Unit) }
                 .collect { update ->
@@ -997,14 +998,15 @@ class RouteAvoidEngineTest {
      *
      * A non-cancellation exception inside the arm's one build fails the shared `Deferred`, which every
      * awaiting rung rethrows from `await()`. Before the fix no rung reached its terminal, so the mode
-     * waited out its own timeout rather than being told; the lookup now answers the same
-     * [RouteReason.NO_PATH] surface an unanswered search shows. The sink is the build's own trace hook —
-     * throwing on `HARVEST`, emitted only inside `buildGrid`, fails the build deterministically with no
-     * fixture change — and the arm's three rungs share that one failed build, so all three are answered.
-     * A `CancellationException` is deliberately untouched by the handler, so cancellation stays silent.
+     * waited out its own timeout rather than being told; the lookup now answers [RouteReason.FAILED] —
+     * its own reason, so a crash is never read as the empty sea [RouteReason.NO_PATH] names. The sink is
+     * the build's own trace hook — throwing on `HARVEST`, emitted only inside `buildGrid`, fails the build
+     * deterministically with no fixture change — and the arm's three rungs share that one failed build, so
+     * all three are answered. A `CancellationException` is deliberately untouched by the handler, so
+     * cancellation stays silent.
      */
     @Test
-    fun aFailedBuildAnswersEveryAwaitingRungWithNoPath() = runBlocking {
+    fun aFailedBuildAnswersEveryAwaitingRungWithFailed() = runBlocking {
         val engine = RouteAvoidEngine(
             paceKn = { paceKn },
             verdictWeight = { AppConfig.routeAvoidSlowWaterWeight },
@@ -1019,7 +1021,7 @@ class RouteAvoidEngineTest {
         val subscribed = CompletableDeferred<Unit>()
         val terminals = ConcurrentHashMap<RouteId, RouteUpdate>()
         val allDone = CompletableDeferred<Unit>()
-        val collector = launch(Dispatchers.Default) {
+        val collector = launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
             engine.updates
                 .onStart { subscribed.complete(Unit) }
                 .collect { update ->
@@ -1041,11 +1043,88 @@ class RouteAvoidEngineTest {
             assertNull("a failed build answers no line", terminal.result)
             assertTrue("and no line rides the terminal", terminal.line.isEmpty())
             assertEquals(
-                "the failure is answered with the existing no-path reason, the surface a failed search shows",
-                RouteReason.NO_PATH,
+                "the failure is answered by its own reason, never conflated with an exhausted search",
+                RouteReason.FAILED,
                 terminal.reason
             )
         }
+    }
+
+    // ── The engine's own end ───────────────────────────────────────────────────
+
+    /**
+     * **`close()` cancels the lane, and the lookups on it with it.** The build thread is parked at
+     * `CORRIDOR` — the same hook the D28 gate uses — so the lookup is provably in flight when the engine
+     * is closed; the lookup's job is then cancelled by construction (the lane's `SupervisorJob` is its
+     * parent), and a lookup started after the close runs nothing at all. No timing is asserted: the
+     * job's state is read before and after the one call.
+     */
+    @Test
+    fun closeCancelsTheRunningLookupAndStartsNothingAfterwards() = runBlocking {
+        val buildStarted = CompletableDeferred<Unit>()
+        val released = CountDownLatch(1)
+        val engine = RouteAvoidEngine(
+            paceKn = { paceKn },
+            verdictWeight = { AppConfig.routeAvoidSlowWaterWeight },
+            worldProvider = { FakeWorld() },
+            traceSink = { line ->
+                if (line.startsWith("CORRIDOR")) {
+                    buildStarted.complete(Unit)
+                    // Bounded, so a misfire cannot strand the worker; the bound is a guard, never a measure.
+                    if (!released.await(120_000, TimeUnit.MILLISECONDS)) {
+                        throw IllegalStateException("the close was not delivered within 120 s")
+                    }
+                }
+            }
+        )
+        val declared = engine.routesToCompute(origin, aim) as? RouteDeclarations.Available
+        assertNotNull("the fixture pair declares its three rungs", declared)
+        val computations = declared!!.computations
+
+        val running = engine.startLookup(computations[0].id)
+        withTimeout(120_000) { buildStarted.await() }
+        assertTrue("the lookup is in flight while its build is parked", engine.isLookupActive(running))
+
+        engine.close()
+        released.countDown()
+
+        assertFalse("the close cancelled the running lookup's job", engine.isLookupActive(running))
+        val late = engine.startLookup(computations[1].id)
+        assertFalse("a lookup started after the close runs nothing", engine.isLookupActive(late))
+    }
+
+    // ── An end off the covered region ─────────────────────────────────────────
+
+    /**
+     * **An end outside the region is answered [RouteReason.OFF_WATER], never clamped.** The fake world
+     * names a region the aim stands outside of; the repair passes (open water everywhere), so the refusal
+     * is the build's own, and the lookup's terminal carries the reason by name instead of a line searched
+     * to the grid's edge.
+     */
+    @Test
+    fun anEndOutsideTheRegionIsAnsweredOffWater() = runBlocking {
+        val region = BBox(43.49, 43.51, 6.99, 7.03)
+        val engine = newEngine { FakeWorld(region = region) }
+        val declared = engine.routesToCompute(origin, aim) as? RouteDeclarations.Available
+        assertNotNull("the repair passes on open water, so the pair is declared", declared)
+
+        val subscribed = CompletableDeferred<Unit>()
+        val done = CompletableDeferred<RouteUpdate>()
+        var mainId: RouteId? = null
+        val collector = launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+            engine.updates
+                .onStart { subscribed.complete(Unit) }
+                .collect { update ->
+                    if (update.nextStage == null && update.routeId == mainId) done.complete(update)
+                }
+        }
+        subscribed.await()
+        mainId = engine.startLookup(declared!!.computations[0].id)
+        val terminal = withTimeout(30_000) { done.await() }
+        collector.cancel()
+
+        assertNull("no line is drawn to the region's edge", terminal.result)
+        assertEquals("the pair is refused by name", RouteReason.OFF_WATER, terminal.reason)
     }
 
     // ── The healthy terminal's throwing sink (D39) ─────────────────────────────
@@ -1085,7 +1164,7 @@ class RouteAvoidEngineTest {
 
         val subscribed = CompletableDeferred<Unit>()
         val firstTerminal = CompletableDeferred<RouteUpdate>()
-        val collector = launch(Dispatchers.Default) {
+        val collector = launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
             engine.updates
                 .onStart { subscribed.complete(Unit) }
                 .collect { update ->
@@ -1159,7 +1238,7 @@ class RouteAvoidEngineTest {
         val terminals = ConcurrentHashMap<RouteId, RouteUpdate>()
         val subscribed = CompletableDeferred<Unit>()
         val armDone = CompletableDeferred<Unit>()
-        val collector = launch(Dispatchers.Default) {
+        val collector = launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
             engine.updates
                 .onStart { subscribed.complete(Unit) }
                 .collect { update ->
@@ -1213,6 +1292,92 @@ class RouteAvoidEngineTest {
         assertTrue(
             "every ranked rung is one the arm declared",
             verdict.order.all { it.lookupId in computations.map { c -> c.id }.toSet() }
+        )
+    }
+
+    // ── One pair, one line, from either end ─────────────────────────────────────
+
+    /**
+     * **A pair armed from either end draws one line per rung and one crown.** The search leaves the pair's
+     * canonical end, the pull keeps the cheaper of both walks, and every drawing stage after them — the corner
+     * snap, the fine pass, the corner pass — now runs in that same canonical direction, so the drawn points
+     * of A→B are exactly the drawn points of B→A reversed. The island fixture is the one the clearance test
+     * uses, so each rung has a real detour to draw; a fold that still read the landing order could crown
+     * two rungs on two armings, which the last assertion catches.
+     */
+    @Test
+    fun aPairArmedFromEitherEndDrawsOneLineAndOneCrown() = runBlocking {
+        val island = circleRing(LatLng(43.5000, 7.0300), radiusM = 400.0)
+        val world = FakeWorld(edges = island.toMutableList())
+        val there = solveLadder(newEngine { world }, origin, aim)
+        val back = solveLadder(newEngine { world }, aim, origin)
+        for (rung in 0 until 3) {
+            val a = there.results[rung]
+            val b = back.results[rung]
+            assertNotNull("rung $rung lands from A", a)
+            assertNotNull("rung $rung lands from B", b)
+            assertTrue("rung $rung draws a detour", a!!.points.size > 2)
+            assertEquals("rung $rung is one line from either end", a.points, b!!.points.reversed())
+        }
+        assertEquals("and the ladder crowns the same rung", there.crown, back.crown)
+    }
+
+    /**
+     * **The clock's own vertices are symmetric too.** A line crossing a speed limit is re-vertexed where the
+     * limit changes, by a bisection the clock runs along the leg; split from the arming end it could land a
+     * boundary vertex a last bit apart in the two directions. The split now reads each leg in canonical
+     * direction, so the published points — boundary vertices included — are one list from either end. The
+     * zone lies across the straight line with the price switch armed, so the rungs round it and the lines
+     * cross its collar and interior at several boundaries.
+     */
+    @Test
+    fun aPairCrossingALimitBoundaryStillDrawsOneLineFromEitherEnd() = runBlocking {
+        setAvoidSwitch("routeAvoidSpeedZoneEnabled", true)
+        val zone = SpeedZone("z", "Cap", 5.0, rectRing(43.478, 43.522, 7.020, 7.040))
+        val world = FakeWorld(zones = listOf(zone))
+        val there = solveLadder(newEngine { world }, origin, aim)
+        val back = solveLadder(newEngine { world }, aim, origin)
+        var crossings = 0
+        for (rung in 0 until 3) {
+            val a = there.results[rung]
+            val b = back.results[rung]
+            assertNotNull("rung $rung lands from A", a)
+            assertNotNull("rung $rung lands from B", b)
+            if (a!!.legSpeedsMps.any { it < Units.knotsToMps(paceKn) - 1e-9 }) crossings++
+            assertEquals("rung $rung is one line from either end, boundary vertices included", a.points, b!!.points.reversed())
+        }
+        assertTrue("the fixture's lines meet the limit", crossings > 0)
+        assertEquals("and the ladder crowns the same rung", there.crown, back.crown)
+    }
+
+    /** One arm's three rungs: each rung's result by ladder index, and the crowned rung's index. */
+    private class Ladder(val results: List<RouteResult.Success?>, val crown: Int?)
+
+    /** Arms [engine] on the pair, starts every rung and awaits every terminal. */
+    private suspend fun solveLadder(engine: RouteAvoidEngine, from: RoutePoint, to: RoutePoint): Ladder = coroutineScope {
+        val declared = engine.routesToCompute(from, to) as RouteDeclarations.Available
+        val computations = declared.computations
+        val terminals = ConcurrentHashMap<RouteId, RouteUpdate>()
+        val subscribed = CompletableDeferred<Unit>()
+        val armDone = CompletableDeferred<Unit>()
+        val collector = launch(Dispatchers.Default, start = CoroutineStart.UNDISPATCHED) {
+            engine.updates
+                .onStart { subscribed.complete(Unit) }
+                .collect { update ->
+                    if (update.nextStage == null) {
+                        terminals[update.routeId] = update
+                        if (terminals.size == computations.size) armDone.complete(Unit)
+                    }
+                }
+        }
+        subscribed.await()
+        val lookups = computations.map { engine.startLookup(it.id) }
+        withTimeout(120_000) { armDone.await() }
+        collector.cancel()
+        val verdict = terminals.values.mapNotNull { it.verdict }.maxByOrNull { it.best.compared }
+        Ladder(
+            results = lookups.map { terminals[it]?.result },
+            crown = verdict?.let { v -> lookups.indexOf(v.best.lookupId) }
         )
     }
 
@@ -1273,14 +1438,16 @@ class RouteAvoidEngineTest {
         /** The sounding (m) the depth layer answers, or `NaN` for an unsurveyed point. */
         private val depth: (Double, Double) -> Double = { _, _ -> Double.NaN },
         /** The speed zones the world answers, priced only while the engine's switch is armed. */
-        private val zones: List<SpeedZone> = emptyList()
+        private val zones: List<SpeedZone> = emptyList(),
+        /** The region the world covers, or `null` (the default) for a world that bounds nothing. */
+        private val region: BBox? = null
     ) : MultipassWorld {
         val boxes = mutableListOf<BBox>()
 
         override val coastlineReady: Boolean get() = ready
         override val depthReady: Boolean get() = depthLoaded
         override val bandWidthM: Double get() = band
-        override val regionBounds: BBox? get() = null
+        override val regionBounds: BBox? get() = region
 
         override fun segmentsIn(box: BBox): List<MultipassEdge> {
             boxes.add(box)
